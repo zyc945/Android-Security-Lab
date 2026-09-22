@@ -1,6 +1,6 @@
 # Android 安全测试机操作规则
 
-这些规则适用于用户自有或已获授权的 Android 安全测试机。独立安装 skill 时，将下文 `./bin/android-lab` 替换为 skill 内 `scripts/android-lab` 的绝对路径，并从选定实验室目录执行。
+这些规则适用于用户自有或已获授权的 Android 安全测试机。独立安装 skill 时，将下文 `./bin/android-lab` 替换为 `bash /absolute/path/to/skill/scripts/android-lab`（ZIP 安装可能不保留执行权限），并从选定实验室目录执行。
 
 ## 默认工作方式
 
