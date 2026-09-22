@@ -1,0 +1,25 @@
+# Local lab data and configuration, at any depth
+artifacts/
+.venv/
+venv/
+.codex/
+.agents/
+.env
+.env.*
+!.env.example
+.DS_Store
+__pycache__/
+*.pyc
+*.apk
+*.apks
+*.aab
+*.mitm
+*.pcap
+*.pcapng
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore

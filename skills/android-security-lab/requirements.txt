@@ -1,0 +1,4 @@
+# Example compatible version pair. Match the client to your own phone server.
+frida==17.17.0
+# CLI paired with the pinned client; not a claim about the latest release.
+frida-tools==14.10.4

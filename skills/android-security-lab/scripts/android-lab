@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="${ANDROID_LAB_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+ADB_BIN="${ADB_BIN:-adb}"
+SERIAL="${ANDROID_SERIAL:-}"
+ADB_ARGS=()
+FRIDA_FORWARD_PORT=""
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: android-lab [-s SERIAL] COMMAND [ARGS...]
+
+Read-only commands:
+  devices                         List ADB devices
+  doctor                          Check device, root, Frida and host tools
+  apps [TEXT]                     List third-party packages
+  package-info PACKAGE            Show package metadata
+  frida-status                    Show Frida version, process and listener
+  frida-ps [ARGS...]              Run the pinned Frida process lister
+  ui-dump                         Print the current UI hierarchy XML
+
+Explicit actions:
+  shell [COMMAND...]              Run an ADB shell or open an interactive one
+  root-shell                      Open an interactive Magisk root shell
+  root 'COMMAND'                  Run one explicit command as Magisk root
+  logcat PACKAGE                  Stream logs for a running package
+  pull-apk PACKAGE [DIR]          Pull all APK splits into artifacts/
+  screenshot [FILE]               Save the current screen into artifacts/
+  input ARGS...                   Pass arguments to Android's input command
+  open-url URL                    Open an HTTP(S) URL on the device
+  proxy status
+  proxy set HOST PORT             Set the Android global HTTP proxy
+  proxy clear                     Clear the Android global HTTP proxy
+
+Set ANDROID_SERIAL or use -s when more than one device is connected.
+EOF
+}
+
+list_devices() {
+  "$ADB_BIN" devices -l
+}
+
+select_device() {
+  command -v "$ADB_BIN" >/dev/null 2>&1 || die "adb not found: $ADB_BIN"
+
+  if [[ -n "$SERIAL" ]]; then
+    [[ "$("$ADB_BIN" -s "$SERIAL" get-state 2>/dev/null || true)" == "device" ]] || \
+      die "ADB device is not ready: $SERIAL"
+  else
+    local line state
+    local -a devices=()
+    while read -r line state _; do
+      [[ "$state" == "device" ]] && devices+=("$line")
+    done < <("$ADB_BIN" devices | tail -n +2)
+
+    case "${#devices[@]}" in
+      0) die "no authorized ADB device connected" ;;
+      1) SERIAL="${devices[0]}" ;;
+      *) die "multiple devices connected; use -s SERIAL or ANDROID_SERIAL" ;;
+    esac
+  fi
+
+  ADB_ARGS=(-s "$SERIAL")
+}
+
+run_adb() {
+  "$ADB_BIN" "${ADB_ARGS[@]}" "$@"
+}
+
+require_package() {
+  [[ "${1:-}" =~ ^[A-Za-z0-9._]+$ ]] || die "invalid Android package name: ${1:-<empty>}"
+}
+
+root_command() {
+  [[ $# -eq 1 ]] || die "root requires one quoted command string"
+  local escaped
+  escaped="$(printf '%s' "$1" | sed "s/'/'\"'\"'/g")"
+  run_adb shell "su -c '$escaped'"
+}
+
+frida_tool() {
+  local tool="$1"
+  shift
+  local executable="$ROOT_DIR/.venv/bin/$tool"
+  [[ -x "$executable" ]] || die "$tool is missing; create $ROOT_DIR/.venv and install the bundled requirements.txt"
+
+  FRIDA_FORWARD_PORT="${LAB_FRIDA_PORT:-27042}"
+  run_adb forward "tcp:$FRIDA_FORWARD_PORT" tcp:27042 >/dev/null
+  cleanup_forward() {
+    run_adb forward --remove "tcp:$FRIDA_FORWARD_PORT" >/dev/null 2>&1 || true
+  }
+  trap cleanup_forward EXIT INT TERM
+  "$executable" -H "127.0.0.1:$FRIDA_FORWARD_PORT" "$@"
+}
+
+doctor() {
+  local root_id frida_version frida_process frida_listener
+  root_id="$(run_adb shell su -c id 2>&1 || true)"
+  frida_version="$(root_command 'if [ -x /data/adb/modules/magisk-frida/bin/frida-server ]; then /data/adb/modules/magisk-frida/bin/frida-server --version; else frida-server --version; fi' 2>&1 || true)"
+  frida_process="$(run_adb shell ps -A -o USER,PID,NAME,ARGS | grep -E '^[^ ]+[[:space:]]+[0-9]+[[:space:]]+frida-server[[:space:]]' || true)"
+  frida_listener="$(root_command 'ss -lntp 2>/dev/null | grep 27042' 2>&1 || true)"
+
+  printf 'device.serial=%s\n' "$SERIAL"
+  printf 'device.model=%s %s\n' \
+    "$(run_adb shell getprop ro.product.manufacturer)" \
+    "$(run_adb shell getprop ro.product.model)"
+  printf 'device.android=%s api=%s patch=%s\n' \
+    "$(run_adb shell getprop ro.build.version.release)" \
+    "$(run_adb shell getprop ro.build.version.sdk)" \
+    "$(run_adb shell getprop ro.build.version.security_patch)"
+  printf 'device.selinux=%s verified_boot=%s bootloader_locked=%s\n' \
+    "$(run_adb shell getenforce)" \
+    "$(run_adb shell getprop ro.boot.verifiedbootstate)" \
+    "$(run_adb shell getprop ro.boot.flash.locked)"
+  printf 'root=%s\n' "$root_id"
+  printf 'frida.version=%s\n' "${frida_version:-not found}"
+  printf 'frida.process=%s\n' "${frida_process:-not running}"
+  printf 'frida.listener=%s\n' "${frida_listener:-not listening}"
+  printf 'proxy=%s\n' "$(run_adb shell settings get global http_proxy)"
+
+  local tool path
+  for tool in adb fastboot apktool mitmproxy nmap scrcpy jadx; do
+    path="$(command -v "$tool" 2>/dev/null || true)"
+    printf 'host.%s=%s\n' "$tool" "${path:-missing}"
+  done
+  for tool in frida frida-ps; do
+    path="$ROOT_DIR/.venv/bin/$tool"
+    [[ -x "$path" ]] || path="missing (create $ROOT_DIR/.venv and install the bundled requirements.txt)"
+    printf 'host.%s=%s\n' "$tool" "$path"
+  done
+}
+
+COMMAND="${1:-help}"
+if [[ "$COMMAND" == "-s" ]]; then
+  [[ $# -ge 3 ]] || die "-s requires SERIAL and COMMAND"
+  SERIAL="$2"
+  shift 2
+  COMMAND="$1"
+fi
+[[ $# -gt 0 ]] && shift
+
+case "$COMMAND" in
+  help|-h|--help)
+    usage
+    exit 0
+    ;;
+  devices)
+    list_devices
+    exit 0
+    ;;
+esac
+
+select_device
+
+case "$COMMAND" in
+  doctor)
+    doctor
+    ;;
+  apps)
+    if [[ $# -eq 0 ]]; then
+      run_adb shell pm list packages -3 | sed 's/^package://'
+    else
+      run_adb shell pm list packages -3 | sed 's/^package://' | grep -iF -- "$1" || true
+    fi
+    ;;
+  package-info)
+    require_package "${1:-}"
+    run_adb shell dumpsys package "$1"
+    ;;
+  frida-status)
+    root_command 'if [ -x /data/adb/modules/magisk-frida/bin/frida-server ]; then /data/adb/modules/magisk-frida/bin/frida-server --version; else frida-server --version; fi; ps -A -o USER,PID,NAME,ARGS | grep -E "^[^ ]+[[:space:]]+[0-9]+[[:space:]]+frida-server[[:space:]]"; ss -lntp 2>/dev/null | grep 27042'
+    ;;
+  frida-ps)
+    frida_tool frida-ps "$@"
+    ;;
+  ui-dump)
+    run_adb shell uiautomator dump /dev/tty
+    ;;
+  shell)
+    run_adb shell "$@"
+    ;;
+  root-shell)
+    run_adb shell su
+    ;;
+  root)
+    root_command "$@"
+    ;;
+  logcat)
+    require_package "${1:-}"
+    pid="$(run_adb shell pidof "$1" | tr -d '\r')"
+    [[ -n "$pid" ]] || die "package is not running: $1"
+    run_adb logcat --pid="$pid"
+    ;;
+  pull-apk)
+    require_package "${1:-}"
+    package="$1"
+    output_dir="${2:-$ROOT_DIR/artifacts/apks/$package}"
+    mkdir -p "$output_dir"
+    count=0
+    while IFS= read -r remote_path; do
+      remote_path="${remote_path#package:}"
+      remote_path="${remote_path%$'\r'}"
+      [[ -n "$remote_path" ]] || continue
+      count=$((count + 1))
+      run_adb pull "$remote_path" "$output_dir/$count-$(basename "$remote_path")"
+    done < <(run_adb shell pm path "$package")
+    [[ $count -gt 0 ]] || die "package not found: $package"
+    printf '%s\n' "$output_dir"
+    ;;
+  screenshot)
+    output_file="${1:-$ROOT_DIR/artifacts/screenshots/$(date +%Y%m%d-%H%M%S).png}"
+    mkdir -p "$(dirname "$output_file")"
+    run_adb exec-out screencap -p >"$output_file"
+    printf '%s\n' "$output_file"
+    ;;
+  input)
+    [[ $# -gt 0 ]] || die "input requires Android input arguments"
+    run_adb shell input "$@"
+    ;;
+  open-url)
+    [[ "${1:-}" =~ ^https?:// ]] || die "open-url only accepts HTTP(S) URLs"
+    run_adb shell am start -a android.intent.action.VIEW -d "$1"
+    ;;
+  proxy)
+    action="${1:-status}"
+    case "$action" in
+      status)
+        run_adb shell settings get global http_proxy
+        ;;
+      set)
+        host="${2:-}"
+        port="${3:-}"
+        [[ "$host" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid proxy host"
+        [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || die "invalid proxy port"
+        run_adb shell settings put global http_proxy "$host:$port"
+        printf 'proxy=%s:%s\n' "$host" "$port"
+        ;;
+      clear)
+        run_adb shell settings put global http_proxy :0
+        printf 'proxy=cleared\n'
+        ;;
+      *) die "unknown proxy action: $action" ;;
+    esac
+    ;;
+  *)
+    usage >&2
+    die "unknown command: $COMMAND"
+    ;;
+esac

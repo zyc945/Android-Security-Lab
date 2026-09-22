@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export ANDROID_LAB_ROOT="${ANDROID_LAB_ROOT:-$REPO_DIR}"
+exec "$REPO_DIR/skills/android-security-lab/scripts/android-lab" "$@"
