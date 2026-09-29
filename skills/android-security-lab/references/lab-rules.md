@@ -23,13 +23,11 @@
 
 启动前记录原有代理与 `adb forward --list` / `adb reverse --list`；若 8080 映射已被占用，不要覆盖。结束时恢复原值，只删除本次创建的映射。以下清理示例假设原先没有代理。
 
-启动抓包时先创建产物目录并建立 USB 代理链路：
+启动抓包时先创建产物目录并启动代理；确认监听成功后再连接手机：
 
 ```bash
 capture_dir="artifacts/mitm/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$capture_dir"
-adb reverse tcp:8080 tcp:8080
-./bin/android-lab proxy set 127.0.0.1 8080
 mitmweb \
   --listen-host 127.0.0.1 --listen-port 8080 \
   --web-host 127.0.0.1 --web-port 8081 \
@@ -37,10 +35,11 @@ mitmweb \
   --save-stream-file "$capture_dir/phone-capture.mitm"
 ```
 
-`mitmweb` 在前台持续运行，Web 界面使用它输出的本地 `127.0.0.1:8081` 地址。另开终端发起并验证 HTTPS 请求：
+`mitmweb` 在前台持续运行，使用可见启动日志的终端。Web 界面使用输出的完整地址，保留 `?token=...`（如有）。确认 8080/8081 监听属于本次进程后，另开终端建立转发并验证 HTTPS 请求；将该终端的 `capture_dir` 设为上面记录的同一个目录，不通过“最新目录”猜测会话。故障诊断见 [capture.md](capture.md)。
 
 ```bash
-capture_dir="$(find artifacts/mitm -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"
+adb reverse tcp:8080 tcp:8080
+./bin/android-lab proxy set 127.0.0.1 8080
 ./bin/android-lab open-url "https://example.com/?mitmproxy_test=$(date +%s)"
 mitmdump -nr "$capture_dir/phone-capture.mitm" '~u mitmproxy_test'
 ```
