@@ -18,7 +18,11 @@ Usage: android-lab [-s SERIAL] COMMAND [ARGS...]
 
 Read-only commands:
   devices                         List ADB devices
-  doctor                          Check device, root, Frida and host tools
+  doctor [--json] [--for WORKFLOW] Check host/device readiness; works offline
+                                  WORKFLOW: adb, frida, capture, apk
+                                  --root opts into read-only su probes
+  apk-inspect APK...|DIR           Inspect local APKs or a pull manifest offline
+  logcat-dump PACKAGE [COUNT]      JSON tail of main logs for one PID (default 500)
   apps [TEXT]                     List third-party packages
   package-info PACKAGE            Show package metadata
   frida-status                    Show Frida version, process and listener
@@ -95,43 +99,6 @@ frida_tool() {
     frida --port "${LAB_FRIDA_PORT:-27042}" -- "$executable" "$@"
 }
 
-doctor() {
-  local root_id frida_version frida_process frida_listener
-  root_id="$(run_adb shell su -c id 2>&1 || true)"
-  frida_version="$(root_command 'if [ -x /data/adb/modules/magisk-frida/bin/frida-server ]; then /data/adb/modules/magisk-frida/bin/frida-server --version; else frida-server --version; fi' 2>&1 || true)"
-  frida_process="$(run_adb shell ps -A -o USER,PID,NAME,ARGS | grep -E '^[^ ]+[[:space:]]+[0-9]+[[:space:]]+frida-server[[:space:]]' || true)"
-  frida_listener="$(root_command 'ss -lntp 2>/dev/null | grep 27042' 2>&1 || true)"
-
-  printf 'device.serial=%s\n' "$SERIAL"
-  printf 'device.model=%s %s\n' \
-    "$(run_adb shell getprop ro.product.manufacturer)" \
-    "$(run_adb shell getprop ro.product.model)"
-  printf 'device.android=%s api=%s patch=%s\n' \
-    "$(run_adb shell getprop ro.build.version.release)" \
-    "$(run_adb shell getprop ro.build.version.sdk)" \
-    "$(run_adb shell getprop ro.build.version.security_patch)"
-  printf 'device.selinux=%s verified_boot=%s bootloader_locked=%s\n' \
-    "$(run_adb shell getenforce)" \
-    "$(run_adb shell getprop ro.boot.verifiedbootstate)" \
-    "$(run_adb shell getprop ro.boot.flash.locked)"
-  printf 'root=%s\n' "$root_id"
-  printf 'frida.version=%s\n' "${frida_version:-not found}"
-  printf 'frida.process=%s\n' "${frida_process:-not running}"
-  printf 'frida.listener=%s\n' "${frida_listener:-not listening}"
-  printf 'proxy=%s\n' "$(run_adb shell settings get global http_proxy)"
-
-  local tool path
-  for tool in adb fastboot apktool mitmproxy nmap scrcpy jadx; do
-    path="$(command -v "$tool" 2>/dev/null || true)"
-    printf 'host.%s=%s\n' "$tool" "${path:-missing}"
-  done
-  for tool in frida frida-ps; do
-    path="$ROOT_DIR/.venv/bin/$tool"
-    [[ -x "$path" ]] || path="missing (create $ROOT_DIR/.venv and install the bundled requirements.txt)"
-    printf 'host.%s=%s\n' "$tool" "$path"
-  done
-}
-
 COMMAND="${1:-help}"
 if [[ "$COMMAND" == "-s" ]]; then
   [[ $# -ge 3 ]] || die "-s requires SERIAL and COMMAND"
@@ -150,14 +117,24 @@ case "$COMMAND" in
     list_devices
     exit 0
     ;;
+  doctor)
+    exec "${PYTHON:-python3}" "$SCRIPT_DIR/doctor.py" --adb "$ADB_BIN" \
+      --serial "$SERIAL" --root-dir "$ROOT_DIR" "$@"
+    ;;
+  apk-inspect)
+    exec "${PYTHON:-python3}" "$SCRIPT_DIR/apk_inspect.py" "$@"
+    ;;
+  logcat-dump)
+    [[ $# -ge 1 && $# -le 2 ]] || die "logcat-dump requires PACKAGE [COUNT]"
+    require_package "$1"
+    [[ "${2:-500}" =~ ^[1-9][0-9]{0,4}$ ]] && (( ${2:-500} <= 10000 )) || \
+      die "count must be between 1 and 10000"
+    ;;
 esac
 
 select_device
 
 case "$COMMAND" in
-  doctor)
-    doctor
-    ;;
   apps)
     if [[ $# -eq 0 ]]; then
       run_adb shell pm list packages -3 | sed 's/^package://'
@@ -192,6 +169,10 @@ case "$COMMAND" in
     pid="$(run_adb shell pidof "$1" | tr -d '\r')"
     [[ -n "$pid" ]] || die "package is not running: $1"
     run_adb logcat --pid="$pid"
+    ;;
+  logcat-dump)
+    exec "${PYTHON:-python3}" "$SCRIPT_DIR/logcat_dump.py" --adb "$ADB_BIN" \
+      --serial "$SERIAL" "$@"
     ;;
   pull-apk)
     require_package "${1:-}"

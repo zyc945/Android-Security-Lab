@@ -14,12 +14,16 @@ from unittest import mock
 
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "skills/android-security-lab/scripts"))
 ADB = r'''#!/usr/bin/env python3
 import json, os, shlex, sys
 from pathlib import Path
 p = Path(os.environ['FAKE_STATE'])
 s = json.loads(p.read_text())
 a = sys.argv[1:]
+if a == ['version']:
+    print('fake adb 1.0')
+    sys.exit(0)
 serial = a[1] if a[:1] == ['-s'] else 'test-device'
 if a[:1] == ['-s']: a = a[2:]
 if a[:1] == ['shell']: a = ['shell'] + shlex.split(' '.join(a[1:]))
@@ -44,21 +48,33 @@ elif a[:1] in (['forward'], ['reverse']):
         else:
             s[kind] = [row for row in rows if row[1] != source]
             s[kind].append([serial if kind == 'forward' else 'UsbFfs', source, target])
-elif a[:4] == ['shell', 'settings', 'get', 'global']: out = s['proxy']
+elif a[:4] == ['shell', 'settings', 'get', 'global']:
+    out = s['proxy']
+    if s.get('overflow_get'): out += 'x' * (1024 * 1024 + 1)
 elif a[:4] == ['shell', 'settings', 'put', 'global']:
     s['proxy'] = a[5]
     if s.get('set_fails'): code, out = 1, 'reply lost after proxy write'
+    if s.get('overflow_set') and a[5] == '127.0.0.1:8080': out = 'x' * (1024 * 1024 + 1)
 elif a[:4] == ['shell', 'settings', 'delete', 'global']: s['proxy'] = 'null'
 else: code, out = 1, 'unexpected command: ' + repr(a)
 if s.get('offline_cleanup') and a[:2] in (['reverse', '--list'], ['forward', '--list']) and Path(os.environ['FAKE_CHILD']).exists():
     code, out = 1, 'device offline'
-p.write_text(json.dumps(s))
+pending = p.with_name(p.name + '.' + str(os.getpid()) + '.tmp')
+pending.write_text(json.dumps(s))
+pending.replace(p)
+if s.get('interrupt_create') and '--no-rebind' in a:
+    import signal, time
+    os.kill(os.getppid(), signal.SIGTERM)
+    time.sleep(30)
 print(out)
 sys.exit(code)
 '''
 CHILD = r'''#!/usr/bin/env python3
 import json, os, signal, sys, time
 from pathlib import Path
+if sys.argv[1:] == ['--version']:
+    print('fake child 1.0')
+    sys.exit(0)
 state = Path(os.environ['FAKE_STATE'])
 marker = Path(os.environ['FAKE_CHILD'])
 marker.write_text(str(os.getpid()))
@@ -66,14 +82,18 @@ mode = os.environ.get('FAKE_MODE', 'exit')
 if mode == 'replace':
     s = json.loads(state.read_text())
     s['forward'] = [['other-device', 'tcp:27042', 'tcp:9999']]
-    state.write_text(json.dumps(s))
+    pending = state.with_name(state.name + '.' + str(os.getpid()) + '.tmp')
+    pending.write_text(json.dumps(s))
+    pending.replace(state)
 if mode == 'exit': sys.exit(0)
 if mode == 'fail': sys.exit(7)
 def stop(signum, frame):
     if mode == 'external-proxy':
         s = json.loads(state.read_text())
         s['proxy'] = 'external.example:8888'
-        state.write_text(json.dumps(s))
+        pending = state.with_name(state.name + '.' + str(os.getpid()) + '.tmp')
+        pending.write_text(json.dumps(s))
+        pending.replace(state)
     Path(str(marker) + '.stopped').write_text(str(signum))
     sys.exit(0)
 signal.signal(signal.SIGINT, stop)
@@ -127,7 +147,9 @@ class SessionTests(unittest.TestCase):
     def update(self, **values):
         state = self.read()
         state.update(values)
-        self.state.write_text(json.dumps(state))
+        pending = self.state.with_name('test-state.tmp')
+        pending.write_text(json.dumps(state))
+        pending.replace(self.state)
 
     def command(self, *args):
         return ['bash', str(REPO / 'bin/android-lab'), '-s', 'test-device', *args]
@@ -214,6 +236,13 @@ class SessionTests(unittest.TestCase):
         report = json.loads((self.capture / 'session.json').read_text())
         self.assertEqual(report['cleanup_errors'], [])
         self.assertEqual(report['https_decryption'], 'not_tested')
+        self.assertEqual(report['schema_version'], 1)
+        self.assertEqual(report['operation'], 'capture')
+        self.assertLessEqual(report['started_at'], report['finished_at'])
+        self.assertTrue(report['limitations'])
+        self.assertEqual(report['tools']['adb']['version'], 'fake adb 1.0')
+        self.assertEqual(report['tools']['mitmweb']['version'], 'fake child 1.0')
+        self.assertEqual(report['failures'][0]['code'], 'interrupted')
 
     def test_capture_sigterm_restores_absent_proxy(self):
         process = self.start_capture()
@@ -341,7 +370,7 @@ class SessionTests(unittest.TestCase):
         session = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(session)
         calls = []
-        def fake_run(command):
+        def fake_run(command, cancel=True):
             calls.append(command)
             if '--no-rebind' in command:
                 raise subprocess.TimeoutExpired(command, 10)
@@ -354,6 +383,98 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertFalse(any('--remove' in command for command in calls))
         self.assertIn('ownership unknown', errors.getvalue())
+
+    def test_capture_startup_output_overflow_has_structured_failure(self):
+        self.update(overflow_get=True)
+        result = self.run_cli('capture', str(self.capture))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse(self.marker.exists())
+        self.assertEqual(self.read()['reverse'], [])
+        report = json.loads((self.capture / 'session.json').read_text())
+        self.assertEqual((report['failures'][0]['stage'], report['failures'][0]['code']),
+                         ('inspect_proxy', 'output_limit'))
+        self.assertEqual(report['mapping_created'], None)
+
+    def test_capture_output_overflow_after_proxy_write_still_cleans_resources(self):
+        self.update(overflow_set=True)
+        self.env['FAKE_MODE'] = 'wait'
+        result = self.run_cli('capture', str(self.capture))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(self.read()['proxy'], 'null')
+        self.assertEqual(self.read()['reverse'], [])
+        self.assertTrue(Path(str(self.marker) + '.stopped').exists())
+        report = json.loads((self.capture / 'session.json').read_text())
+        self.assertEqual((report['failures'][0]['stage'], report['failures'][0]['code']),
+                         ('set_proxy', 'output_limit'))
+        self.assertEqual(report['cleanup_errors'], [])
+
+    def test_capture_signal_during_mapping_creation_preserves_unknown_mapping(self):
+        self.update(interrupt_create=True)
+        self.env['FAKE_MODE'] = 'wait'
+        result = self.run_cli('capture', str(self.capture))
+        self.assertEqual(result.returncode, 143, result.stderr)
+        self.assertEqual(self.read()['reverse'], [['UsbFfs', 'tcp:8080', 'tcp:8080']])
+        self.assertFalse(any('--remove' in call for call in self.read()['calls']))
+        self.assertEqual(self.read()['proxy'], 'null')
+        self.assertTrue(Path(str(self.marker) + '.stopped').exists())
+        report = json.loads((self.capture / 'session.json').read_text())
+        self.assertIsNone(report['mapping_created'])
+        self.assertEqual((report['failures'][0]['stage'], report['failures'][0]['code']),
+                         ('create_mapping', 'interrupted'))
+        self.assertIn('ownership unknown', report['error'])
+
+    def test_mapping_cancel_during_creation_does_not_claim_or_delete_mapping(self):
+        path = REPO / 'skills/android-security-lab/scripts/lab_session.py'
+        spec = importlib.util.spec_from_file_location('lab_session_cancel_test', path)
+        session = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(session)
+        calls = []
+
+        def fake_run(command, cancel=True):
+            calls.append(command)
+            if '--no-rebind' in command:
+                session.request_stop(signal.SIGTERM, None)
+                raise InterruptedError('creation reply interrupted')
+            return ''
+
+        argv = ['lab_session.py', '--adb', 'fake-adb', '--serial', 'test-device',
+                'frida', '--', 'fake-frida']
+        with mock.patch.object(sys, 'argv', argv), mock.patch.object(session, 'run', fake_run), \
+                mock.patch.object(session.signal, 'signal'), contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(session.main(), 143)
+        self.assertFalse(any('--remove' in command for command in calls))
+        self.assertIn('ownership unknown', errors.getvalue())
+
+    def test_mapping_cancel_keeps_query_process_cleanup_failure(self):
+        path = REPO / 'skills/android-security-lab/scripts/lab_session.py'
+        spec = importlib.util.spec_from_file_location('lab_session_cleanup_test', path)
+        session = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(session)
+        calls = []
+        def fake_run(command, cancel=True):
+            calls.append(command)
+            if '--no-rebind' in command:
+                session.request_stop(signal.SIGTERM, None)
+                error = InterruptedError('creation reply interrupted')
+                error.cleanup_errors = ['process group stop not confirmed: injected denial']
+                raise error
+            return 'null' if 'settings' in command else ''
+        child = mock.Mock(pid=123, returncode=None)
+        argv = ['lab_session.py', '--adb', 'fake-adb', '--serial', 'test-device',
+                'capture', str(self.capture)]
+        with mock.patch.object(sys, 'argv', argv), mock.patch.object(session, 'run', fake_run), \
+                mock.patch.object(session, 'listeners', return_value=[]), \
+                mock.patch.object(session, 'wait_listeners'), mock.patch.object(session, 'stop_child'), \
+                mock.patch.object(session, 'tool_identity', return_value={'path': 'fake', 'version': None}), \
+                mock.patch.object(session.subprocess, 'Popen', return_value=child), \
+                mock.patch.object(session.signal, 'signal'), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(session.main(), 2)
+        report = json.loads((self.capture / 'session.json').read_text())
+        self.assertEqual(report['failures'][0]['code'], 'interrupted')
+        self.assertIn('group stop not confirmed', report['failures'][0]['cleanup_errors'][0])
+        self.assertTrue(report['cleanup_errors'])
+        self.assertIsNone(report['mapping_created'])
+        self.assertFalse(any('--remove' in command for command in calls))
 
 
 if __name__ == '__main__':

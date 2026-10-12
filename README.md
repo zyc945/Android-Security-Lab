@@ -49,7 +49,7 @@ https://github.com/zyc945/Android-Security-Lab/tree/main/skills/android-security
 - 设备操作：ADB（Android Platform Tools）；手机开启 USB 调试并授权主机。
 - Frida：Python 3 与 venv，以及匹配版本的手机 server。
 - 静态分析或抓包：按任务自行安装 JADX、apktool、mitmproxy 等工具。
-- 普通 ADB 功能不要求 root；`doctor` 会尝试只读 `su` 查询，可能触发设备授权提示。缺少 root、CA 或 Frida server 不代表普通 ADB 不可用。
+- 普通 ADB 功能不要求 root；`doctor` 默认不调用 `su`，`--root` 才启用只读 root 查询，可能触发设备授权提示。缺少 root、CA 或 Frida server 不代表普通 ADB 不可用。
 - 手机端服务、Magisk 模块或 CA 的安装属于单独的设备变更。
 
 独立安装后的 Frida 环境可这样准备（将 `skill_dir` 改为安装器报告的实际目录，先核对手机 server 版本）：
@@ -93,6 +93,9 @@ cp -R -n skills/android-security-lab "${CODEX_HOME:-$HOME/.codex}/skills/"
 make check
 ./bin/android-lab devices
 ./bin/android-lab doctor
+./bin/android-lab doctor --json --for adb
+# 离线 APK 检查不要求 ADB 或手机：
+./bin/android-lab doctor --json --for apk
 # 需要 Frida 时，先匹配版本再安装：
 make setup
 make frida-ps
@@ -110,6 +113,9 @@ ANDROID_SERIAL=YOUR_DEVICE_SERIAL ./bin/android-lab doctor
 ```bash
 ./bin/android-lab package-info com.example.app
 ./bin/android-lab pull-apk com.example.app
+./bin/android-lab apk-inspect artifacts/apks/com.example.app/YOUR_PULL_DIR
+./bin/android-lab apk-inspect artifacts/example.apk
+./bin/android-lab logcat-dump com.example.app 500
 ./bin/android-lab screenshot
 ./bin/android-lab ui-dump
 ./bin/android-lab capture
@@ -128,6 +134,18 @@ HTTPS 抓包按 [USB 抓包流程](skills/android-security-lab/references/lab-ru
 `pull-apk PACKAGE [DIR]` 为每个成功 APK 记录来源路径、产物路径、字节数和 SHA-256 到 `DIR/manifest.json`；单个 split 失败后继续，保留成功文件并删除本次失败残片。结果 `coverage` 为 `complete` / `partial` / `none`，退出码分别是 0 / 1 / 2；只在完整成功时向 stdout 输出目录，失败时 stderr 指向 manifest。设备枚举失败与“没有 APK 路径”分别记录。
 
 两个命令默认使用带时间和进程号的新产物目录，显式指定的 `DIR` 必须不存在，避免覆盖或混入旧产物。Python helper 使用 Python 3.9+ 标准库，无新增第三方依赖。
+
+结果保留原有字段和退出码，并增加 `schema_version`、操作名、UTC 开始/结束时间、工具路径与版本（未知为 `null`）及限制。`failures` 增加失败阶段、稳定错误码和 `error_truncated`；错误摘录最多 2048 字符。APK 来源枚举、拉取、摘要、完成文件和清理分别报告；manifest 无法写入时通过 stderr 和退出码报告。新 APK 记录还包含相对 manifest 目录的 `relative_path`，旧 `local_path` 保留。
+
+## 离线诊断与 APK 摘要
+
+`doctor --json` 在没有手机时仍输出主机检查。`--for adb|frida|capture|apk` 选择必需项；省略时审查设备连接和可选工具。`apk` 指离线摘要，设备拉取需要 `adb` 就绪。缺少可选工具不导致所选流程失败；必需项未知或未检查不能算通过。退出码 0 表示必需检查通过，1 表示未就绪，2 表示参数无效。就绪不证明实际 attach、抓包解密或分析成功；捕获端口和代理归属仍由启动流程核对。
+
+`apk-inspect APK...` 或 `apk-inspect PULL_DIR` 完全离线，只读取本地文件。目录模式按 manifest 的 APK 清单读取，拒绝越界路径和符号链接，并核对已有摘要。输出包含 APK SHA-256、打包 ABI、原生库清单、Flutter/React Native 标记及对应 APK/ZIP 路径。`source_coverage` 表示输入 APK 集合的获取覆盖度，`inventory_coverage` 表示本次检查覆盖度，`coverage` 表示整体结果；退出码为完整 0、部分 1、无结果/无效 2。仅提供部分 APK 时，未发现标记不能说明整个应用未使用某框架；ABI 目录不证明 ELF 架构或运行时加载。该命令不解包、不执行 APK、不解码 Manifest 或资源，也不推测 Dart SDK 版本。预算和范围见 [分析说明](skills/android-security-lab/references/reverse-analysis.md)。
+
+`logcat-dump PACKAGE [COUNT]` 进入采集 helper 后向 stdout 输出一个 JSON 结果，诊断写 stderr；wrapper 参数或设备选择失败时可能仅输出 stderr。默认 500 行，范围 1–10000。只读取采集时单个 PID 的 main 缓冲区尾部，多 PID 会拒绝；历史覆盖度为 partial，空结果不证明没有日志。采集成功退出 0，运行失败/中断退出 1，直接 helper 的参数错误退出 2。原 `logcat` 保留交互式连续输出。
+
+后台 ADB/工具查询同时限制时间和 stdout/stderr 合计字节数：APK 路径枚举 64 KiB、常规查询和拉取进度 1 MiB、工具版本 16 KiB。超限报告 `output_limit`，超时报告 `timeout`；本次子进程会被终止并回收。前台 mitmweb 和交互式 logcat 的输出继续直接交给终端。
 
 ADB 没有会话所有者标识，核对映射和删除并非原子操作；参数相同的删除后重建也无法识别。SIGKILL、主机断电不能执行清理；设备断连或 ADB 无法响应时会报告可能残留，不宣称恢复成功。保留产物后按 [抓包恢复流程](skills/android-security-lab/references/capture.md) 核对当前状态，避免盲目删除映射。
 

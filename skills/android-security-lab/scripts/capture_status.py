@@ -2,15 +2,18 @@
 """Read-only snapshot of one USB mitmweb capture chain. No repair actions."""
 import argparse
 import json
+import signal
 import subprocess
+
+from lab_common import run_bounded
 
 
 def run(args):
     try:
-        p = subprocess.run(args, capture_output=True, text=True, timeout=10)
-        return p.returncode, p.stdout.strip(), p.stderr.strip()
-    except (OSError, subprocess.TimeoutExpired) as error:
-        return 2, "", str(error)
+        p = run_bounded(args, 10)
+        return p.returncode, p.stdout.strip(), p.stderr.strip(), []
+    except (OSError, subprocess.SubprocessError) as error:
+        return 2, "", str(error), getattr(error, 'cleanup_errors', [])
 
 
 def classify(proxy, reverse, proxy_listener, ui_listener, port):
@@ -47,16 +50,43 @@ def main():
               "reverse": adb + ["reverse", "--list"]}
     for name, port in (("proxy_listener", args.proxy_port), ("ui_listener", args.web_port)):
         checks[name] = ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fpcn"]
-    results = {name: run(command) for name, command in checks.items()}
-    errors = {name: err or f"exit {code}" for name, (code, out, err) in results.items()
+    interrupted = False
+    def stop(signum, _frame):
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt
+    previous = {s: signal.signal(s, stop) for s in (signal.SIGINT, signal.SIGTERM)}
+    results = {}
+    current_check = 'command'
+    try:
+        for current_check, command in checks.items():
+            results[current_check] = run(command)
+    except KeyboardInterrupt as error:
+        cleanup_errors = {name: cleanup for name, (_, _, _, cleanup) in results.items() if cleanup}
+        if getattr(error, 'cleanup_errors', None):
+            cleanup_errors[current_check] = error.cleanup_errors
+        errors = {name: err or f'exit {code}' for name, (code, out, err, cleanup) in results.items()
+                  if code and not (name.endswith('listener') and code == 1 and not out and not err)}
+        errors[current_check] = 'interrupted'
+        print(json.dumps({'observations': {name: out for name, (_, out, _, _) in results.items()},
+                          'errors': errors,
+                          'issues': ['interrupted'], 'https_decryption': 'not_tested',
+                          'cleanup_errors': cleanup_errors}))
+        return 2
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+    errors = {name: err or f"exit {code}" for name, (code, out, err, cleanup) in results.items()
               if code and not (name.endswith("listener") and code == 1 and not out and not err)}
-    values = {name: out for name, (_, out, _) in results.items()}
+    values = {name: out for name, (_, out, _, _) in results.items()}
+    cleanup_errors = {name: cleanup for name, (_, _, _, cleanup) in results.items() if cleanup}
     issues = classify(values["proxy"], values["reverse"], values["proxy_listener"],
                       values["ui_listener"], args.proxy_port)
     if values["device"] != "device":
         issues.insert(0, "device_not_online")
     print(json.dumps({"observations": values, "errors": errors, "issues": issues,
-                      "https_decryption": "not_tested"}, indent=2))
+                      "https_decryption": "not_tested", "cleanup_errors": cleanup_errors}, indent=2))
     return 2 if errors else (1 if issues else 0)
 
 

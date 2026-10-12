@@ -4,6 +4,12 @@
 
 Pull the installed base APK and splits with the wrapper; inspect the returned filenames (this wrapper may prefix them with numbers). Record package version and SHA-256. Inspect assets/native libraries before assuming Java contains the target algorithm:
 
+Use `android-lab apk-inspect APK...` or `android-lab apk-inspect PULL_DIR` for a local ZIP inventory before choosing tools. Directory mode accepts only the manifest's APKs and verifies recorded size/hash; it does not discover missing splits by scanning nearby files. New manifests use `relative_path`; older `local_path` values resolve against the original calling directory when relative, so run there or report a resolution failure. Keep acquisition `source_coverage` separate from `inventory_coverage`. A direct APK list covers only the supplied inputs; negative framework findings do not establish absence from the installed app.
+
+The inventory reports native library entry names and declared sizes, not ELF architecture or runtime loading. Flutter `libapp.so`/`libflutter.so` and React Native `assets/index.android.bundle` entries are candidates with their exact ZIP paths as basis. Custom packaging may hide those markers. The helper does not decompress libraries, parse Dart snapshots, decode binary Manifest/resources, execute code, or look up framework versions; use JADX, Apktool, or a suitable native tool for deeper questions.
+
+Fixed budgets limit local APK count to 32, each APK to 2 GiB, manifest and ZIP central directory to 8 MiB, ZIP entries to 100000 (classic ZIP's count limit still applies), ZIP paths to 1024 characters, ABI count to 32, and reported libraries to 500. ZIP64/multi-volume archives and duplicate relevant entries are refused. Input changes detected during hashing/inventory report `artifact_changed`; ordinary file-stat checks do not provide an adversarial immutable snapshot. Save JSON under `artifacts/` when needed; never overwrite the source pull manifest.
+
 - Java/Kotlin: JADX and targeted searches/cross-references.
 - React Native: inspect `assets/index.android.bundle`; `file` can identify Hermes bytecode and its version. Use a compatible disassembler; plain strings locate candidates but do not prove call semantics.
 - Flutter/native/JNI: inspect the relevant libraries and symbols before selecting native analysis tools.

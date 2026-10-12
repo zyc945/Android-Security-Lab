@@ -16,6 +16,7 @@ from unittest import mock
 
 
 HELPER = Path(__file__).resolve().parents[1] / "skills/android-security-lab/scripts/pull_apk.py"
+sys.path.insert(0, str(HELPER.parent))
 WRAPPER = Path(__file__).resolve().parents[1] / "bin/android-lab"
 FAKE_ADB = r'''
 import json
@@ -27,6 +28,9 @@ import time
 
 config = json.loads(Path(os.environ["FAKE_ADB_CONFIG"]).read_text())
 args = sys.argv[1:]
+if args == ["version"]:
+    print("fake adb 1.0")
+    sys.exit(0)
 with Path(os.environ["FAKE_ADB_LOG"]).open("a") as log:
     log.write(json.dumps(args) + "\n")
 assert args[:2] == ["-s", "fake-serial"]
@@ -40,6 +44,9 @@ if args == ["shell", "pm", "path", "com.example.app"]:
     sys.exit(config.get("pm_exit", 0))
 assert args[0] == "pull"
 remote, local = args[1:]
+if remote in config.get("overflow", []):
+    sys.stdout.write("x" * (1024 * 1024 + 1))
+    sys.stdout.flush()
 if remote in config.get("missing", []):
     sys.exit(0)
 Path(local).write_bytes(bytes.fromhex(config.get("data", "0061706bff")))
@@ -97,7 +104,7 @@ class PullApkTests(unittest.TestCase):
 
     def pulls(self):
         return [json.loads(line)[3] for line in self.log.read_text().splitlines()
-                if json.loads(line)[2] == "pull"]
+                if len(json.loads(line)) > 2 and json.loads(line)[2] == "pull"]
 
     def test_split_hashes_and_unique_names(self):
         paths = ["/data/app/one/base.apk", "/data/app/two/base.apk", "/data/app/space name/split config.apk"]
@@ -110,11 +117,19 @@ class PullApkTests(unittest.TestCase):
         self.assertEqual(manifest["serial"], "fake-serial")
         self.assertEqual(manifest["coverage"], "complete")
         self.assertEqual(manifest["failures"], [])
+        self.assertEqual(manifest["schema_version"], 1)
+        self.assertEqual(manifest["operation"], "pull_apk")
+        self.assertLessEqual(manifest["started_at"], manifest["finished_at"])
+        self.assertTrue(manifest["limitations"])
+        self.assertTrue(manifest["tools"]["python"]["version"])
+        self.assertEqual(manifest["tools"]["adb"]["version"], "fake adb 1.0")
         self.assertEqual(self.pulls(), paths)
         for item in manifest["artifacts"]:
             self.assertEqual(item["size_bytes"], len(data))
             self.assertEqual(item["sha256"], hashlib.sha256(data).hexdigest())
             self.assertEqual(Path(item["local_path"]).read_bytes(), data)
+            self.assertEqual(item["relative_path"], Path(item["local_path"]).name)
+            self.assertEqual((self.output / item["relative_path"]).read_bytes(), data)
         self.assertEqual(len({item["local_path"] for item in manifest["artifacts"]}), 3)
 
     def test_middle_pull_failure_keeps_successes_and_continues(self):
@@ -129,6 +144,9 @@ class PullApkTests(unittest.TestCase):
         self.assertEqual(manifest["failures"][0]["remote_path"], paths[1])
         self.assertIn("original error\n", manifest["failures"][0]["error"])
         self.assertLessEqual(len(manifest["failures"][0]["error"]), 2048)
+        self.assertTrue(manifest["failures"][0]["error_truncated"])
+        self.assertEqual(manifest["failures"][0]["stage"], "pull")
+        self.assertEqual(manifest["failures"][0]["code"], "command_failed")
         self.assertFalse(list(self.output.glob("*.partial")))
         self.assertFalse((self.output / "2-bad.apk").exists())
 
@@ -200,7 +218,7 @@ class PullApkTests(unittest.TestCase):
         manifest = self.manifest()
         self.assertEqual(manifest["coverage"], "partial")
         self.assertEqual([item["remote_path"] for item in manifest["artifacts"]], ["/data/base.apk"])
-        self.assertEqual(manifest["failures"][0], {"remote_path": "/data/stop.apk", "error": "APK extraction interrupted (SIGINT)"})
+        self.assertEqual(manifest["failures"][0], {"remote_path": "/data/stop.apk", "error": "APK extraction interrupted (SIGINT)", "stage": "pull", "code": "interrupted", "error_truncated": False})
         self.assertEqual(self.pulls(), ["/data/base.apk", "/data/stop.apk"])
         self.assertFalse(list(self.output.glob("*.partial")))
 
@@ -253,22 +271,23 @@ class PullApkTests(unittest.TestCase):
         self.assertEqual(self.manifest()["coverage"], "partial")
         self.assertEqual(self.manifest()["artifacts"][0]["remote_path"], "/data/last.apk")
         self.assertIn("timeout detail\n", self.manifest()["failures"][0]["error"])
+        self.assertEqual(self.manifest()["failures"][0]["code"], "timeout")
         self.assertFalse(list(self.output.glob("*.partial")))
 
     def test_run_adb_timeout_reaps_child_and_retains_stderr(self):
         helper = self.load_helper()
-        process = mock.MagicMock()
-        process.communicate.side_effect = [
-            subprocess.TimeoutExpired(["adb"], 600), ("progress", "timeout stderr\n"),
-        ]
-        process.__enter__.return_value = process
-        with mock.patch.object(helper.subprocess, "Popen", return_value=process):
-            with self.assertRaises(subprocess.TimeoutExpired) as raised:
-                helper.run_adb("adb", "fake-serial", "pull", "/data/base.apk", "local", timeout=600)
-        self.assertEqual(process.method_calls[:3], [
-            mock.call.communicate(timeout=600), mock.call.kill(), mock.call.communicate(),
-        ])
-        self.assertEqual(raised.exception.stderr, "timeout stderr\n")
+        marker = self.root / "pid"
+        self.adb.write_text("#!" + sys.executable + "\n" +
+                            "import os, sys, time\n" +
+                            "from pathlib import Path\n" +
+                            f"Path({str(marker)!r}).write_text(str(os.getpid()))\n" +
+                            "print('timeout stderr', file=sys.stderr, flush=True)\n" +
+                            "time.sleep(30)\n")
+        with self.assertRaises(subprocess.TimeoutExpired) as raised:
+            helper.run_adb(str(self.adb), "fake-serial", "pull", "/data/base.apk", "local", timeout=2)
+        self.assertIn("timeout stderr", raised.exception.stderr)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(marker.read_text()), 0)
 
     def test_manifest_write_failure_returns_two(self):
         helper = self.load_helper()
@@ -283,6 +302,7 @@ class PullApkTests(unittest.TestCase):
             self.assertEqual(helper.main(), 2)
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("cannot write manifest", stderr.getvalue())
+        self.assertIn("stage=write_manifest code=io_error", stderr.getvalue())
         self.assertFalse((self.output / "manifest.json").exists())
         self.assertFalse((self.output / ".manifest.json.tmp").exists())
         self.assertEqual((self.output / "1-base.apk").read_bytes(), b"apk")
@@ -326,26 +346,100 @@ class PullApkTests(unittest.TestCase):
 
     def test_repeated_signals_do_not_interrupt_child_reaping(self):
         helper = self.load_helper()
-        process = mock.MagicMock()
-        process.__enter__.return_value = process
-        calls = []
+        marker = self.root / "pid"
+        self.adb.write_text("#!" + sys.executable + "\n" +
+                            "import os, signal, sys, time\n" +
+                            "from pathlib import Path\n" +
+                            "if sys.argv[1:] == ['version']: sys.exit(0)\n" +
+                            f"Path({str(marker)!r}).write_text(str(os.getpid()))\n" +
+                            "os.kill(os.getppid(), signal.SIGTERM)\n" +
+                            "time.sleep(30)\n")
+        killpg = os.killpg
 
-        def communicate(timeout=None):
-            calls.append(timeout)
-            if timeout is not None:
-                signal.raise_signal(signal.SIGTERM)
+        def kill_with_signal(pid, signum):
             signal.raise_signal(signal.SIGINT)
-            return "", ""
+            return killpg(pid, signum)
 
-        process.communicate.side_effect = communicate
-        process.kill.side_effect = lambda: signal.raise_signal(signal.SIGTERM)
-        with mock.patch.object(sys, "argv", [str(HELPER), "--adb", str(self.adb), "--serial", "fake-serial", "com.example.app", str(self.output)]), mock.patch.object(helper.subprocess, "Popen", return_value=process), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        with mock.patch.object(sys, "argv", [str(HELPER), "--adb", str(self.adb), "--serial", "fake-serial", "com.example.app", str(self.output)]), mock.patch.object(os, "killpg", side_effect=kill_with_signal) as killed, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(helper.main(), 2)
-        self.assertEqual(calls, [20, None])
-        self.assertEqual(process.method_calls[:3], [
-            mock.call.communicate(timeout=20), mock.call.kill(), mock.call.communicate(),
-        ])
+        killed.assert_called_once()
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(marker.read_text()), 0)
         self.assertEqual(self.manifest()["failures"][0]["error"], "APK extraction interrupted (SIGTERM)")
+
+    def test_pm_output_overflow_does_not_pull(self):
+        result = self.run_helper({"paths": "package:/data/base.apk\n" * 4000})
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(self.pulls(), [])
+        failure = self.manifest()["failures"][0]
+        self.assertEqual((failure["stage"], failure["code"]), ("resolve_paths", "output_limit"))
+
+    def test_pull_output_overflow_continues_to_later_file(self):
+        result = self.run_helper({"paths": "package:/data/base.apk\npackage:/data/last.apk\n",
+                                  "overflow": ["/data/base.apk"]})
+        self.assertEqual(result.returncode, 1, result.stderr)
+        manifest = self.manifest()
+        self.assertEqual([item["remote_path"] for item in manifest["artifacts"]], ["/data/last.apk"])
+        self.assertEqual((manifest["failures"][0]["stage"], manifest["failures"][0]["code"]),
+                         ("pull", "output_limit"))
+        self.assertFalse(list(self.output.glob("*.partial")))
+
+    def test_rename_and_partial_unlink_failures_retain_evidence_and_continue(self):
+        helper = self.load_helper()
+        unlink = Path.unlink
+
+        def fake_adb(adb, serial, *args, timeout):
+            if args[0] == "shell":
+                return subprocess.CompletedProcess([], 0, "package:/data/base.apk\npackage:/data/last.apk\n", "")
+            Path(args[-1]).write_bytes(b"apk")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        rename = Path.rename
+        def fail_rename(path, target):
+            if path.name == "1-base.apk.partial":
+                raise OSError("rename blocked")
+            return rename(path, target)
+
+        def fail_unlink(path, *args, **kwargs):
+            if path.name == "1-base.apk.partial":
+                raise OSError("unlink blocked")
+            return unlink(path, *args, **kwargs)
+
+        with mock.patch.object(sys, "argv", [str(HELPER), "--adb", str(self.adb), "--serial", "fake-serial", "com.example.app", str(self.output)]), mock.patch.object(helper, "run_adb", side_effect=fake_adb), mock.patch.object(Path, "rename", autospec=True, side_effect=fail_rename), mock.patch.object(Path, "unlink", autospec=True, side_effect=fail_unlink), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(helper.main(), 1)
+        manifest = self.manifest()
+        self.assertEqual([(f["stage"], f["code"]) for f in manifest["failures"]],
+                         [("finalize", "io_error"), ("cleanup", "io_error")])
+        self.assertEqual((self.output / "1-base.apk.partial").read_bytes(), b"apk")
+        self.assertEqual([item["remote_path"] for item in manifest["artifacts"]], ["/data/last.apk"])
+
+    def test_digest_read_failure_records_stage_and_removes_partial(self):
+        helper = self.load_helper()
+        original_open = Path.open
+
+        def fake_adb(adb, serial, *args, timeout):
+            if args[0] == "shell":
+                return subprocess.CompletedProcess([], 0, "package:/data/base.apk\n", "")
+            Path(args[-1]).write_bytes(b"apk")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        def fail_read(path, *args, **kwargs):
+            if path.suffix == ".partial" and args[:1] == ("rb",):
+                raise OSError("read blocked")
+            return original_open(path, *args, **kwargs)
+
+        with mock.patch.object(sys, "argv", [str(HELPER), "--adb", str(self.adb), "--serial", "fake-serial", "com.example.app", str(self.output)]), mock.patch.object(helper, "run_adb", side_effect=fake_adb), mock.patch.object(Path, "open", autospec=True, side_effect=fail_read), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(helper.main(), 2)
+        failure = self.manifest()["failures"][0]
+        self.assertEqual((failure["stage"], failure["code"]), ("digest", "io_error"))
+        self.assertFalse(list(self.output.glob("*.partial")))
+
+    def test_empty_and_invalid_path_failure_codes(self):
+        for index, (paths, expected) in enumerate([( "", "empty_paths"), ("bad\n", "invalid_output")]):
+            self.output = self.root / f"code-{index}"
+            self.run_helper({"paths": paths})
+            failure = self.manifest()["failures"][0]
+            self.assertEqual((failure["stage"], failure["code"]), ("resolve_paths", expected))
 
 
 if __name__ == "__main__":
