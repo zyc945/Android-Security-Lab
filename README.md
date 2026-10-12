@@ -112,11 +112,26 @@ ANDROID_SERIAL=YOUR_DEVICE_SERIAL ./bin/android-lab doctor
 ./bin/android-lab pull-apk com.example.app
 ./bin/android-lab screenshot
 ./bin/android-lab ui-dump
+./bin/android-lab capture
 ```
 
 `ANDROID_LAB_ROOT` 可指定另一实验室目录，`.venv` 和 `artifacts/` 都随之定位；`ADB_BIN` 可指定 ADB 路径。`LAB_FRIDA_PORT` 可指定未占用的主机 Frida 转发端口（默认 27042），避免覆盖既有转发。
 
 HTTPS 抓包按 [USB 抓包流程](skills/android-security-lab/references/lab-rules.md) 操作。代理与 Web UI 只监听 `127.0.0.1`，使用 USB ADB reverse；结束时恢复原代理，仅清理本次转发。已有 CA 不重复安装，应用解密失败也不能直接认定为证书固定。
+
+## 会话清理与提取结果
+
+`frida-ps` 创建转发前检查占用，并用 ADB `--no-rebind` 防止覆盖其他会话。命令退出、失败或收到 Ctrl+C / SIGTERM 时，只删除仍匹配所选设备和端口的本次转发；被替换的映射保留并报告清理失败。ADB 调用失败或超时不能证明资源归属，不强行删除。
+
+`capture [DIR]` 在前台运行 mitmweb，固定使用回环地址 8080/8081。先验证两个监听属于本次进程，再创建 USB reverse 并设置手机代理。退出时恢复原 `http_proxy`、核对并删除本次 reverse，然后停止本次子进程；某步清理失败也继续其他步骤。已占用的端口或映射会拒绝启动，外部修改的代理或映射保留。最后将结果、清理错误和 `https_decryption: "not_tested"` 写入 `DIR/session.json`。监听就绪不等于 HTTPS 已解密，仍需实际请求验证。
+
+`pull-apk PACKAGE [DIR]` 为每个成功 APK 记录来源路径、产物路径、字节数和 SHA-256 到 `DIR/manifest.json`；单个 split 失败后继续，保留成功文件并删除本次失败残片。结果 `coverage` 为 `complete` / `partial` / `none`，退出码分别是 0 / 1 / 2；只在完整成功时向 stdout 输出目录，失败时 stderr 指向 manifest。设备枚举失败与“没有 APK 路径”分别记录。
+
+两个命令默认使用带时间和进程号的新产物目录，显式指定的 `DIR` 必须不存在，避免覆盖或混入旧产物。Python helper 使用 Python 3.9+ 标准库，无新增第三方依赖。
+
+ADB 没有会话所有者标识，核对映射和删除并非原子操作；参数相同的删除后重建也无法识别。SIGKILL、主机断电不能执行清理；设备断连或 ADB 无法响应时会报告可能残留，不宣称恢复成功。保留产物后按 [抓包恢复流程](skills/android-security-lab/references/capture.md) 核对当前状态，避免盲目删除映射。
+
+开发验证使用 `make test`：只运行模拟 ADB/mitmweb 的测试，不连接手机。
 
 ## 分享与隐私
 

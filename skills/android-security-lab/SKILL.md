@@ -29,3 +29,9 @@ Keep app-specific keys, endpoints, module IDs, device identifiers, and capture c
 Match claims to checks: a listener is not a decrypted flow; an attached Frida session is not a captured function call; a controlled function call is not the original user-action call chain; matching an offline signature is not a successful API request; Python success is not Kotlin compilation or device validation.
 
 Keep interactive capture/mirroring running when requested. At an actual stop, restore the pre-session proxy state and remove only mappings/processes created for that session. Do not stop unrelated Frida, scrcpy, or capture sessions. Report remaining persistent changes and unfinished verification.
+
+For a new USB capture, prefer `android-lab capture [NEW_DIR]` after announcing its proxy/reverse changes. It owns the foreground mitmweb process, verifies listener ownership, and attempts cleanup on normal exit, Ctrl+C, SIGTERM or startup failure. Keep the process running while capture is requested; inspect its `session.json` after it stops. A cleanup error means current phone state still needs inspection. This command does not install CAs or verify decryption.
+
+`frida-ps` refuses occupied forward ports and checks mapping identity before cleanup. ADB exposes no owner token or atomic compare-and-delete; changed mappings are preserved and uncertain creation is reported. Do not claim SIGKILL or device-disconnect cleanup succeeded.
+
+`pull-apk` writes `manifest.json` with per-file SHA-256/size and failures. Use a new output directory and inspect `coverage`: exit 0 is complete, 1 is partial, 2 is none/setup failure. Retained successful files are usable evidence even when another split failed; never present a partial APK set as complete.

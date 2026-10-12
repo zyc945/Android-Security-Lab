@@ -21,7 +21,15 @@
 - 只监听主机回环地址，通过 USB ADB reverse 转发，不把代理端口或 mitmweb 暴露到局域网。
 - 已安装并验证系统 CA 时不要重复安装；证书或 Magisk 模块变更仍须按上文要求先说明影响和回滚方式。
 
-启动前记录原有代理与 `adb forward --list` / `adb reverse --list`；若 8080 映射已被占用，不要覆盖。结束时恢复原值，只删除本次创建的映射。以下清理示例假设原先没有代理。
+新会话优先使用前台命令（`DIR` 必须不存在；省略时自动创建新目录）：
+
+```bash
+./bin/android-lab -s SERIAL capture artifacts/mitm/my-new-capture
+```
+
+它先核对 8080/8081 监听，再创建不覆盖既有映射的 USB reverse 并设置手机代理。退出时恢复原代理、核对并删除本次 reverse、停止本次 mitmweb，结果写入 `session.json`。运行前仍须说明精确设备、临时代理与 reverse 的影响和恢复方式；监听成功后按下文验证真实 HTTPS。Ctrl+C 或 SIGTERM 触发清理，SIGKILL/断电不保证清理；清理错误必须继续检查当前状态。
+
+以下为手动或自定义端口流程。启动前记录原有代理与 `adb forward --list` / `adb reverse --list`；若 8080 映射已被占用，不要覆盖。结束时恢复原值，只删除本次创建且现值仍一致的映射。以下清理示例假设原先没有代理。
 
 启动抓包时先创建产物目录并启动代理；确认监听成功后再连接手机：
 
@@ -38,7 +46,7 @@ mitmweb \
 `mitmweb` 在前台持续运行，使用可见启动日志的终端。Web 界面使用输出的完整地址，保留 `?token=...`（如有）。确认 8080/8081 监听属于本次进程后，另开终端建立转发并验证 HTTPS 请求；将该终端的 `capture_dir` 设为上面记录的同一个目录，不通过“最新目录”猜测会话。故障诊断见 [capture.md](capture.md)。
 
 ```bash
-adb reverse tcp:8080 tcp:8080
+adb reverse --no-rebind tcp:8080 tcp:8080
 ./bin/android-lab proxy set 127.0.0.1 8080
 ./bin/android-lab open-url "https://example.com/?mitmproxy_test=$(date +%s)"
 mitmdump -nr "$capture_dir/phone-capture.mitm" '~u mitmproxy_test'

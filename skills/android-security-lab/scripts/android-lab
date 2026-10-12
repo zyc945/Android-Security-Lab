@@ -2,10 +2,10 @@
 set -euo pipefail
 
 ROOT_DIR="${ANDROID_LAB_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ADB_BIN="${ADB_BIN:-adb}"
 SERIAL="${ANDROID_SERIAL:-}"
 ADB_ARGS=()
-FRIDA_FORWARD_PORT=""
 
 die() {
   printf 'error: %s\n' "$*" >&2
@@ -31,6 +31,7 @@ Explicit actions:
   root 'COMMAND'                  Run one explicit command as Magisk root
   logcat PACKAGE                  Stream logs for a running package
   pull-apk PACKAGE [DIR]          Pull all APK splits into artifacts/
+  capture [DIR]                  Run USB mitmweb; restore proxy/mapping on exit
   screenshot [FILE]               Save the current screen into artifacts/
   input ARGS...                   Pass arguments to Android's input command
   open-url URL                    Open an HTTP(S) URL on the device
@@ -90,13 +91,8 @@ frida_tool() {
   local executable="$ROOT_DIR/.venv/bin/$tool"
   [[ -x "$executable" ]] || die "$tool is missing; create $ROOT_DIR/.venv and install the bundled requirements.txt"
 
-  FRIDA_FORWARD_PORT="${LAB_FRIDA_PORT:-27042}"
-  run_adb forward "tcp:$FRIDA_FORWARD_PORT" tcp:27042 >/dev/null
-  cleanup_forward() {
-    run_adb forward --remove "tcp:$FRIDA_FORWARD_PORT" >/dev/null 2>&1 || true
-  }
-  trap cleanup_forward EXIT INT TERM
-  "$executable" -H "127.0.0.1:$FRIDA_FORWARD_PORT" "$@"
+  exec "${PYTHON:-python3}" "$SCRIPT_DIR/lab_session.py" --adb "$ADB_BIN" --serial "$SERIAL" \
+    frida --port "${LAB_FRIDA_PORT:-27042}" -- "$executable" "$@"
 }
 
 doctor() {
@@ -200,18 +196,14 @@ case "$COMMAND" in
   pull-apk)
     require_package "${1:-}"
     package="$1"
-    output_dir="${2:-$ROOT_DIR/artifacts/apks/$package}"
-    mkdir -p "$output_dir"
-    count=0
-    while IFS= read -r remote_path; do
-      remote_path="${remote_path#package:}"
-      remote_path="${remote_path%$'\r'}"
-      [[ -n "$remote_path" ]] || continue
-      count=$((count + 1))
-      run_adb pull "$remote_path" "$output_dir/$count-$(basename "$remote_path")"
-    done < <(run_adb shell pm path "$package")
-    [[ $count -gt 0 ]] || die "package not found: $package"
-    printf '%s\n' "$output_dir"
+    output_dir="${2:-$ROOT_DIR/artifacts/apks/$package/$(date +%Y%m%d-%H%M%S)-$$}"
+    exec "${PYTHON:-python3}" "$SCRIPT_DIR/pull_apk.py" --adb "$ADB_BIN" --serial "$SERIAL" \
+      "$package" "$output_dir"
+    ;;
+  capture)
+    output_dir="${1:-$ROOT_DIR/artifacts/mitm/$(date +%Y%m%d-%H%M%S)-$$}"
+    exec "${PYTHON:-python3}" "$SCRIPT_DIR/lab_session.py" --adb "$ADB_BIN" --serial "$SERIAL" \
+      capture "$output_dir"
     ;;
   screenshot)
     output_file="${1:-$ROOT_DIR/artifacts/screenshots/$(date +%Y%m%d-%H%M%S).png}"

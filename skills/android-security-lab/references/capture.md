@@ -4,6 +4,10 @@ Use [lab-rules.md](lab-rules.md) for setup commands and honor the workspace AGEN
 
 ## Start and prove the path
 
+For a new default-port capture, use `android-lab capture [NEW_DIR]` in a persistent terminal. It checks existing listeners/mappings, starts mitmweb, validates its two loopback listeners, then creates reverse with `--no-rebind` and sets the proxy. Announce the exact selected device and temporary proxy/reverse changes before running it. Stop with Ctrl+C or SIGTERM; inspect `NEW_DIR/session.json` for cleanup errors. The wrapper restores the original proxy only when the current value still belongs to this capture, and preserves externally changed mappings. It rejects an original proxy already pointing to `127.0.0.1:8080` so an existing capture or stale chain must be resolved first.
+
+Continue using the steps below for manual or different-port sessions. Automatic cleanup cannot run after SIGKILL or power loss, and ADB does not provide an owner token or atomic compare-and-delete. An ADB create timeout may have left a mapping: inspect it without assuming this session owns it.
+
 1. Record the selected serial, original proxy, relevant reverse mappings, and host listeners before changing state. Record the capture directory and process/session ID explicitly; do not select an arbitrary "latest" directory during cleanup.
 2. Start mitmweb on host loopback with a persistent terminal (`tty: true`) or a log file so its startup URL is immediately readable. Confirm the process owns the intended proxy/UI ports before directing the phone to it. Do not replace an occupied port or an existing reverse mapping without identifying its owner.
 3. Establish the USB reverse and phone proxy for this session. If setup fails after changing the proxy, restore the original network state before retrying.
